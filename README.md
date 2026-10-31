@@ -12,6 +12,68 @@ RunInfra rejects requests that break a few hard limits, and opencode resends the
 
 Nothing is removed from your stored session: the plugin only rewrites the request on its way to RunInfra, and only for the `runinfra` provider.
 
+## Install with your coding agent
+
+Paste this into your coding agent:
+
+```
+Install this opencode plugin: https://github.com/OmarAlex24/opencode-runinfra-sanitize
+```
+
+The agent follows the steps below. They work the same by hand.
+
+Requires opencode 2.x (tested with 2.2.5; it uses the v2 plugin API, `ctx.session.hook`) and a `runinfra` provider already set up in opencode.
+
+**Agents:** run the steps in order. Don't start opencode or run `opencode run` yourself, and don't edit the opencode config without the user's OK (step 3).
+
+1. **Download the plugin** into opencode's global plugins folder:
+
+   ```sh
+   curl -fsSL --create-dirs \
+     -o "${XDG_CONFIG_HOME:-$HOME/.config}/opencode/plugins/runinfra-sanitize.ts" \
+     https://raw.githubusercontent.com/OmarAlex24/opencode-runinfra-sanitize/main/plugins/runinfra-sanitize.ts
+   ```
+
+   opencode loads every `.ts` file in that folder; no config entry or dependencies are needed.
+
+2. **Check there is a `runinfra` provider.** The plugin reads RunInfra's base URL and API key from it.
+
+   ```sh
+   find "${XDG_CONFIG_HOME:-$HOME/.config}/opencode" -maxdepth 1 \( -name opencode.json -o -name opencode.jsonc \) \
+     -exec grep -l '"runinfra"' {} +
+   ```
+
+   It prints the config file that has it. If it prints nothing, stop here and tell the user to set up RunInfra in opencode first: https://runinfra.ai/docs/tools-sdks/opencode. The plugin does nothing without that provider.
+
+3. **Propose a lower context limit** (see [why](#why-lower-the-context-limit)). In the file from step 2, look under `provider.runinfra.models` for models whose `limit.context` is above 400000. Show the user the change for each one, keeping its `output` as it is:
+
+   ```jsonc
+   "limit": { "context": 1048576, "output": 131072 }  // before
+   "limit": { "context": 400000, "output": 131072 }   // after
+   ```
+
+   Apply it only if the user agrees. Edit just those values in place: the file may be JSONC with comments, so don't rewrite it with a JSON tool. Models with no `limit`, or with 400000 or less, stay as they are.
+
+4. **Verify.** Ask the user to restart opencode (the TUI, or the app that runs its server, such as T3 Code). Then:
+
+   ```sh
+   grep 'loading plugin.*runinfra-sanitize' "${XDG_DATA_HOME:-$HOME/.local/share}/opencode/log/opencode.log" | tail -1
+   ```
+
+   It should print a line with `msg="loading plugin"` and `id=…/plugins/runinfra-sanitize.ts`, timestamped after the restart. `opencode plugin list` only lists package plugins, so it won't show this one.
+
+5. **If opencode runs inside another app** (T3 Code or similar), check opencode's background service:
+
+   ```sh
+   opencode service status
+   ```
+
+   If it's running, stop it with `opencode service stop`, so two opencode servers don't write to the same session database (see [Caveats](#caveats)). Any `opencode` CLI command, including the TUI, starts it again, so check again after using the CLI.
+
+### Why lower the context limit
+
+RunInfra's limit is in bytes, not tokens. In practice ~600k tokens of history already went over 3.5 MB, so if your config declares a 1M-token context, opencode won't auto-compact in time. Around 400000 tokens keeps compaction ahead of the 3.5 MB limit; the plugin's trimming covers the rest.
+
 ## Image labels
 
 Every image gets a stable number by order of first appearance:
@@ -48,32 +110,6 @@ Measured in isolated sessions (same script, back to back, `deepseek-v4-1-flash`,
 With images (`glm-5-3-flash`, one new image per turn), the old 6-image rule broke the prefix on every request that added an image from the 7th on (~50% cached each time). The new one breaks it once, on the 9th, and is back at ~94% on the next. Cache retention is best effort on RunInfra's side, so expect some noise.
 
 The trade-off: after a batch the model sees fewer images (4 instead of up to 8) and less old tool output (history drops to ~2 MB instead of ~3 MB) than strictly needed, and the batch request itself is mostly uncached.
-
-## Install
-
-Requires opencode 2.x (tested with 2.2.5; it uses the v2 plugin API, `ctx.session.hook`).
-
-```sh
-mkdir -p ~/.config/opencode/plugins
-curl -fsSL https://raw.githubusercontent.com/OmarAlex24/opencode-runinfra-sanitize/main/plugins/runinfra-sanitize.ts \
-  -o ~/.config/opencode/plugins/runinfra-sanitize.ts
-```
-
-opencode loads every `.ts` file in that folder; no config entry or dependencies are needed. It reads RunInfra's base URL and API key from your existing `runinfra` provider config. Check it loaded with:
-
-```sh
-grep 'loading plugin' ~/.local/share/opencode/log/opencode.log | tail -1
-```
-
-(`opencode plugin list` only lists package plugins, so it will say "No plugins found".)
-
-### Recommended: lower the context limit
-
-RunInfra's limit is in bytes, not tokens. In practice ~600k tokens of history already went over 3.5 MB, so if your config declares a 1M-token context, opencode won't auto-compact in time. Set something like this for each RunInfra model:
-
-```jsonc
-"limit": { "context": 400000, "output": 131072 }
-```
 
 ## Options
 
