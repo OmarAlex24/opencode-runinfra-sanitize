@@ -1,13 +1,26 @@
 // Sanea los mensajes que opencode (v2) envía al proveedor "runinfra".
 //  - Límites de RunInfra: máx. 8 imágenes por petición (cuenta todo el historial) y
-//    cuerpo de petición de máx. 3,5 MB. Se conservan como mucho las KEEP_IMAGES
-//    imágenes más recientes y, además, se descartan las más antiguas hasta que el
-//    base64 en línea sume menos de BUDGET_BYTES (una imagen que sola no cabe también
-//    se descarta). Las partes no se borran: los pares tool-call/tool-result quedan intactos.
-//  - Etiquetas estables: cada imagen recibe un número por orden de primera aparición
-//    (registro persistente por sesión, sobrevive a la compactación). Antes de cada
-//    imagen conservada va "[imagen N · ruta · descripción]"; cada imagen descartada se
-//    sustituye por "[imagen N omitida · ruta · descripción · vuelve a leer ...]".
+//    cuerpo de petición de máx. 3,5 MB. Las partes no se borran: los pares
+//    tool-call/tool-result quedan intactos.
+//  - Caché de prompts (https://runinfra.ai/docs/cookbook/prompt-caching.md): RunInfra reutiliza
+//    el prefijo byte a byte idéntico más largo con una petición anterior; todo lo que va después
+//    de la primera diferencia se cobra sin caché (~10× más caro). Por eso los recortes van por
+//    lotes con histéresis: al pasar un umbral alto se recorta de golpe hasta un umbral bajo, la
+//    decisión se guarda por sesión y las peticiones siguientes repiten exactamente los mismos
+//    recortes (mismos bytes) y solo añaden al final, hasta que se vuelve a pasar el umbral alto.
+//  - Imágenes: si las conservadas pasan de IMAGES_MAX o su base64 en línea de INLINE_HIGH, se
+//    descartan las más antiguas hasta IMAGES_LOW / INLINE_LOW (sin bajar de las imágenes nuevas
+//    de esta petición mientras quepan en IMAGES_MAX / INLINE_HIGH). Una imagen que sola pasa de
+//    INLINE_HIGH se descarta siempre. Cada aparición se identifica por el id de su tool call
+//    (o, en adjuntos, por hash + ordinal): si el modelo vuelve a leer una imagen descartada, la
+//    nueva lectura es otra aparición y se ve.
+//  - Etiquetas estables: cada imagen recibe un número por orden de primera aparición. Antes de
+//    cada imagen conservada va "[imagen N · ruta · descripción]"; cada imagen descartada se
+//    sustituye por "[imagen N omitida · ruta · descripción · vuelve a leer ...]". Número, ruta y
+//    descripción se fijan la primera vez que se ve cada aparición, así que la etiqueta no cambia.
+//  - Estado por sesión en $XDG_CACHE_HOME/opencode-runinfra/<sesión>/index.json (no depende de
+//    los mensajes, así que sobrevive a la compactación): numeración, apariciones de imágenes
+//    (ruta, descripción, descartada) e ids de tool calls recortados. Los conjuntos solo crecen.
 //  - Ruta: la del archivo leído con read (o el nombre del adjunto) si existe en disco
 //    con el mismo tamaño; si no (adjuntos pegados, salida de shell, data URIs), se
 //    guarda una copia una sola vez en $XDG_CACHE_HOME/opencode-runinfra/<sesión>/imagen-NN.ext.
@@ -20,30 +33,38 @@
 //    Cualquier input que no sea un objeto plano se convierte en {}.
 //  - Tamaño total: tras lo anterior se estima el cuerpo de los mensajes (bytes UTF-8 del
 //    JSON, imágenes incluidas; los argumentos de tool call cuentan doblemente codificados,
-//    como van en el cable). Si pasa de BODY_BUDGET se recorta lo más antiguo primero:
-//    1) salidas de herramientas → primeros HEAD_CHARS caracteres + aviso; 2) si aún no
-//    cabe, strings largos dentro de los inputs de tool calls (mismas claves, sigue siendo
-//    un objeto). Ids y pares tool-call/tool-result quedan intactos. Nunca se tocan los
-//    mensajes system, el último mensaje del usuario ni los KEEP_RECENT_MESSAGES últimos
-//    mensajes (no "los dos últimos turnos del usuario": en un bucle de agente un solo turno
-//    abarca cientos de mensajes y no quedaría nada recortable). Si aun así no cabe, se
-//    envía tal cual y se anota en el log de depuración.
+//    como van en el cable). Primero se repiten los recortes ya guardados de la sesión. Si aun
+//    así pasa de BODY_HIGH se recorta lo más antiguo primero hasta BODY_LOW: 1) salidas de
+//    herramientas → primeros HEAD_CHARS caracteres + aviso; 2) si aún no basta, strings largos
+//    dentro de los inputs de tool calls (mismas claves, sigue siendo un objeto). Ids y pares
+//    tool-call/tool-result quedan intactos. Nunca se tocan los mensajes system, el último
+//    mensaje del usuario ni los KEEP_RECENT_MESSAGES últimos mensajes (no "los dos últimos
+//    turnos del usuario": en un bucle de agente un solo turno abarca cientos de mensajes y no
+//    quedaría nada recortable). Si aun así no cabe, se envía tal cual y se anota en el log.
+//  - Las peticiones de título (hook "title") leen el estado pero no lo modifican.
 // Depuración: OPENCODE_RUNINFRA_SANITIZE_DEBUG=1 escribe un resumen en /tmp/runinfra-sanitize.log
-// (incluidos los bytes reales del cuerpo HTTP de cada petición).
+// (u OPENCODE_RUNINFRA_SANITIZE_LOG): bytes reales del cuerpo HTTP, en qué mensaje y en qué byte
+// cambia el prefijo frente a la petición anterior de la sesión, y los tokens en caché de la respuesta.
 import { createHash } from "node:crypto"
-import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs"
+import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { isAbsolute, join } from "node:path"
 
 const PROVIDER = "runinfra"
-const KEEP_IMAGES = 6
-const BUDGET_BYTES = 2_500_000
+// Umbrales con histéresis para no romper la caché de prompts de RunInfra
+// (https://runinfra.ai/docs/cookbook/prompt-caching.md): cada recorte cambia el prefijo, así que se
+// recorta poco a menudo y mucho de una vez en lugar de un poco en cada turno.
+const IMAGES_MAX = 8 // límite duro de RunInfra: imágenes por petición, contando todo el historial
+const IMAGES_LOW = 4 // al pasar de IMAGES_MAX se descartan las más antiguas hasta dejar estas
+const INLINE_HIGH = 2_500_000 // base64 de imágenes en línea que dispara un descarte
+const INLINE_LOW = 1_500_000 // ...hasta dejar como mucho esto
 // Límite de RunInfra: max_request_bytes = 3_670_016 (GET /models). Fuera de los mensajes van
 // el prompt de sistema y los esquemas de herramientas: medido con el hook http.request
 // ≈ 62 KB en una sesión aislada (48 KB sistema + 14 KB tools) y ≈ 80 KB estimados en T3 Code
 // (18,8k frente a 14,7k tokens en la primera petición). Con 3 MB quedan ~670 KB de margen
 // para eso y para el error de la estimación (que en texto sobreestima ~0,3 %).
-const BODY_BUDGET = 3_000_000
+const BODY_HIGH = 3_000_000 // tamaño estimado de los mensajes que dispara un recorte
+const BODY_LOW = 2_000_000 // ...hasta dejarlos en esto, para que los turnos siguientes solo añadan
 const KEEP_RECENT_MESSAGES = 10
 const HEAD_CHARS = 500
 const OUTPUT_NOTE =
@@ -56,7 +77,8 @@ const CAPTION_PROMPT =
   "Describe esta imagen en español en una sola línea de unas 10 palabras: qué pantalla o vista es, " +
   "el elemento clave visible y su estado. Responde solo con la descripción."
 const DEBUG = process.env.OPENCODE_RUNINFRA_SANITIZE_DEBUG === "1"
-const debug = (o: unknown) => DEBUG && appendFileSync("/tmp/runinfra-sanitize.log", JSON.stringify(o) + "\n")
+const LOG = process.env.OPENCODE_RUNINFRA_SANITIZE_LOG || "/tmp/runinfra-sanitize.log"
+const debug = (o: unknown) => DEBUG && appendFileSync(LOG, JSON.stringify(o) + "\n")
 
 const ROOT = join(process.env.XDG_CACHE_HOME || join(homedir(), ".cache"), "opencode-runinfra")
 const EXT: Record<string, string> = { "image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "image/gif": "gif" }
@@ -72,7 +94,10 @@ const readJSON = (file: string) => {
 }
 const writeFile = (file: string, data: string | Buffer) => {
   mkdirSync(join(file, ".."), { recursive: true })
-  writeFileSync(file, data)
+  // Escritura atómica: un index.json a medio escribir perdería la numeración y los recortes.
+  const tmp = `${file}.${process.pid}.tmp`
+  writeFileSync(tmp, data)
+  renameSync(tmp, file)
 }
 
 function toObject(input: unknown) {
@@ -87,6 +112,7 @@ function toObject(input: unknown) {
 }
 
 type Image = {
+  key: string // identifica la aparición: "call:<toolCallId>:<j>" o "media:<hash>:<ordinal>"
   hash: string
   mime: string
   data?: string // base64 sin prefijo (undefined si es una URL remota)
@@ -98,6 +124,7 @@ type Image = {
   replace: (label: string, keep: boolean) => void
   number?: number
   path?: string
+  caption?: string
 }
 
 // ---------- Modelo de descripciones ----------
@@ -193,24 +220,95 @@ function describe(img: Image, settings: Settings | undefined): Promise<string> {
   return inflight.get(img.hash)!
 }
 
-// ---------- Numeración y rutas ----------
+// ---------- Estado por sesión ----------
 
-function assignNumbers(sessionID: string, images: Image[]) {
-  const dir = join(ROOT, sessionID)
-  const file = join(dir, "index.json")
-  const hashes: string[] = readJSON(file)?.hashes ?? []
+type ImageRecord = { path?: string; caption?: string; dropped?: true }
+type State = {
+  hashes: string[] // numeración: imagen N = hashes[N - 1]
+  images: Record<string, ImageRecord> // por aparición (Image.key)
+  trim: { results: string[]; inputs: string[] } // ids de tool calls con la salida / el input recortados
+}
+
+const safeSession = (id: unknown) => String(id ?? "sin-sesion").replace(/[^\w.-]/g, "_")
+const stateFile = (session: string) => join(ROOT, session, "index.json")
+
+// Lectura y escritura siempre síncronas y sin await entre medias: los hooks concurrentes de una
+// misma sesión no pueden pisarse cambios.
+function loadState(session: string): State {
+  const raw = readJSON(stateFile(session)) ?? {}
+  const list = (x: unknown) => (Array.isArray(x) ? x.filter((v) => typeof v === "string") : [])
+  return {
+    hashes: list(raw.hashes),
+    images: isPlainObject(raw.images) ? raw.images : {},
+    trim: { results: list(raw.trim?.results), inputs: list(raw.trim?.inputs) },
+  }
+}
+
+function saveState(session: string, state: State) {
+  try {
+    writeFile(stateFile(session), JSON.stringify(state))
+  } catch (e) {
+    debug({ at: "state-error", session, error: String(e) })
+  }
+}
+
+// Numera, fija la ruta de cada aparición nueva y decide qué imágenes van en línea.
+// Devuelve el registro de cada aparición (en el mismo orden que images).
+function decideImages(session: string, images: Image[], persist: boolean) {
+  const state = loadState(session)
+  const dir = join(ROOT, session)
   let changed = false
   for (const img of images) {
-    let n = hashes.indexOf(img.hash) + 1
+    let n = state.hashes.indexOf(img.hash) + 1
     if (!n) {
-      hashes.push(img.hash)
-      n = hashes.length
+      state.hashes.push(img.hash)
+      n = state.hashes.length
       changed = true
     }
     img.number = n
-    img.path = resolvePath(img, dir)
   }
-  if (changed) writeFile(file, JSON.stringify({ hashes }))
+  const fresh = new Set(images.filter((img) => !state.images[img.key]).map((img) => img.key))
+  const records = images.map((img) => {
+    let rec = state.images[img.key]
+    if (!rec) {
+      rec = state.images[img.key] = { path: resolvePath(img, dir) }
+      changed = true
+    }
+    if (!rec.dropped && img.bytes > INLINE_HIGH) {
+      rec.dropped = true // sola ya no cabe
+      changed = true
+    }
+    img.path = rec.path
+    return rec
+  })
+  const sum = (list: number[]) => list.reduce((t, i) => t + images[i].bytes, 0)
+  const kept = images.map((_, i) => i).filter((i) => !records[i].dropped)
+  if (kept.length > IMAGES_MAX || sum(kept) > INLINE_HIGH) {
+    // Lote: se descartan las más antiguas hasta el umbral bajo, sin quitar las nuevas de esta
+    // petición mientras quepan en el límite duro.
+    const keptFresh = kept.filter((i) => fresh.has(images[i].key))
+    const maxCount = Math.min(IMAGES_MAX, Math.max(IMAGES_LOW, keptFresh.length))
+    const maxBytes = Math.min(INLINE_HIGH, Math.max(INLINE_LOW, sum(keptFresh)))
+    while (kept.length && (kept.length > maxCount || sum(kept) > maxBytes)) records[kept.shift()!].dropped = true
+    changed = true
+  }
+  if (changed && persist) saveState(session, state)
+  return records
+}
+
+// Guarda la descripción de cada aparición la primera vez (la etiqueta ya no cambia después).
+function freezeCaptions(session: string, images: Image[], records: ImageRecord[], captions: Map<string, string>) {
+  images.forEach((img, i) => (records[i].caption ??= captions.get(img.hash) ?? ""))
+  const state = loadState(session)
+  let changed = false
+  images.forEach((img, i) => {
+    const rec = state.images[img.key]
+    if (rec && rec.caption === undefined) {
+      rec.caption = records[i].caption
+      changed = true
+    }
+  })
+  if (changed) saveState(session, state)
 }
 
 function resolvePath(img: Image, dir: string) {
@@ -244,6 +342,13 @@ const text = (t: string) => ({ type: "text", text: t })
 function collect(messages: any[]) {
   const images: Image[] = []
   const callPaths = new Map<string, unknown>()
+  // Ordinal de cada hash entre las apariciones sin tool call (adjuntos, resultados sin id).
+  const seen = new Map<string, number>()
+  const ordinalKey = (kind: string, hash: string) => {
+    const n = (seen.get(`${kind}:${hash}`) ?? 0) + 1
+    seen.set(`${kind}:${hash}`, n)
+    return `${kind}:${hash}:${n}`
+  }
   let toolInputsFixed = 0
   // Las inserciones se aplican al final, sobre copias de las partes (no se toca el historial guardado).
   const edits = new Map<any[], Map<number, any[]>>()
@@ -266,8 +371,10 @@ function collect(messages: any[]) {
         const src = part.media.source ?? {}
         const { data, url } = src.data ? { data: src.data as string, url: undefined } : imageData(src.url)
         if (!data && !url) return
+        const hash = hashOf(data ?? url!)
         images.push({
-          hash: hashOf(data ?? url!),
+          key: ordinalKey("media", hash),
+          hash,
           mime: src.mediaType ?? part.media.mediaType,
           data,
           url,
@@ -282,8 +389,11 @@ function collect(messages: any[]) {
           if (item.type !== "file" || !isImage(item.mime)) return
           const { data, url } = imageData(item.uri ?? item.url)
           if (!data && !url) return
+          const hash = hashOf(data ?? url!)
+          const id = part.id ?? part.toolCallId
           images.push({
-            hash: hashOf(data ?? url!),
+            key: typeof id === "string" && id ? `call:${id}:${j}` : ordinalKey("result", hash),
+            hash,
             mime: item.mime,
             data,
             url,
@@ -309,15 +419,6 @@ function collect(messages: any[]) {
     }
   }
   return { images, apply, toolInputsFixed }
-}
-
-// Índices de las imágenes que se mantienen en línea: las KEEP_IMAGES más recientes,
-// sin las que solas exceden el presupuesto, y quitando las más antiguas hasta caber.
-function chooseKept(images: Image[]) {
-  let kept = images.map((_, i) => i).slice(-KEEP_IMAGES).filter((i) => images[i].bytes <= BUDGET_BYTES)
-  const total = () => kept.reduce((s, i) => s + images[i].bytes, 0)
-  while (kept.length && total() > BUDGET_BYTES) kept.shift()
-  return new Set(kept)
 }
 
 // ---------- Tamaño total de la petición ----------
@@ -370,42 +471,97 @@ function shrinkInput(part: any) {
   return bytes(input) < bytes(part.input) ? { ...part, input } : part
 }
 
-function fitBudget(hook: string, event: { sessionID?: string; messages: any[] }) {
-  const messages = event.messages
+const idOf = (part: any) => {
+  const id = part.id ?? part.toolCallId
+  return typeof id === "string" && id ? id : undefined
+}
+
+function estimate(messages: any[]) {
   let total = bytes(messages)
   for (const m of messages)
     if (Array.isArray(m.content))
       for (const part of m.content) if (part.type === "tool-call") total += partBytes(part) - bytes(part)
-  if (total <= BODY_BUDGET) return
-  const before = total
+  return total
+}
+
+function fitBudget(hook: string, event: { sessionID?: string; messages: any[] }) {
+  const messages = event.messages
+  const session = safeSession(event.sessionID)
   const lastUser = messages.findLastIndex((m) => m.role === "user")
   const protectFrom = messages.length - KEEP_RECENT_MESSAGES
+  const trimmable = (i: number) =>
+    i < protectFrom && i !== lastUser && messages[i].role !== "system" && Array.isArray(messages[i].content)
+  const state = loadState(session)
+  const shrinkers = [
+    ["tool-result", shrinkResult, state.trim.results],
+    ["tool-call", shrinkInput, state.trim.inputs],
+  ] as const
+  // Recorta las partes de un tipo que cumplan want(); solo copia el array si cambia algo.
+  const shrinkMessage = (
+    i: number,
+    type: string,
+    shrink: (p: any) => any,
+    want: (p: any) => boolean,
+    onShrunk?: (part: any, saved: number) => void,
+  ) => {
+    let count = 0
+    const content = messages[i].content.map((part: any) => {
+      if (part.type !== type || !want(part)) return part
+      const next = shrink(part)
+      if (next === part) return part
+      count++
+      onShrunk?.(part, partBytes(part) - partBytes(next))
+      return next
+    })
+    if (count) messages[i].content = content
+    return count
+  }
+
+  // 1) Repetir los recortes ya decididos: shrink* son deterministas, así que los bytes son los
+  //    mismos que en las peticiones anteriores y el prefijo en caché sigue valiendo.
+  let reapplied = 0
+  for (const [type, shrink, ids] of shrinkers) {
+    if (!ids.length) continue
+    const set = new Set(ids)
+    for (let i = 0; i < messages.length; i++)
+      if (trimmable(i)) reapplied += shrinkMessage(i, type, shrink, (p) => set.has(idOf(p)!))
+  }
+  let total = estimate(messages)
+  if (total <= BODY_HIGH) {
+    if (reapplied) debug({ at: "budget", hook, session: event.sessionID, reapplied, after: total, batch: false })
+    return
+  }
+
+  // 2) Nuevo lote: lo más antiguo primero hasta BODY_LOW; los ids recortados se guardan.
+  const before = total
   const trimmed = { "tool-result": 0, "tool-call": 0 }
-  for (const [type, shrink] of [
-    ["tool-result", shrinkResult],
-    ["tool-call", shrinkInput],
-  ] as const) {
-    for (let i = 0; i < protectFrom && total > BODY_BUDGET; i++) {
-      const message = messages[i]
-      if (message.role === "system" || i === lastUser || !Array.isArray(message.content)) continue
-      if (!message.content.some((part: any) => part.type === type)) continue
-      message.content = message.content.map((part: any) => {
-        if (total <= BODY_BUDGET || part.type !== type) return part
-        const next = shrink(part)
-        if (next === part) return part
-        total -= partBytes(part) - partBytes(next)
-        trimmed[type]++
-        return next
-      })
+  for (const [type, shrink, ids] of shrinkers) {
+    for (let i = 0; i < messages.length && total > BODY_LOW; i++) {
+      if (!trimmable(i)) continue
+      trimmed[type] += shrinkMessage(
+        i,
+        type,
+        shrink,
+        () => total > BODY_LOW,
+        (part, saved) => {
+          total -= saved
+          const id = idOf(part)
+          if (id && !ids.includes(id)) ids.push(id)
+        },
+      )
     }
   }
+  total = estimate(messages)
+  if (hook !== "title" && (trimmed["tool-result"] || trimmed["tool-call"])) saveState(session, state)
   debug({
     at: "budget",
     hook,
     session: event.sessionID,
+    batch: true,
     before,
     after: total,
-    fits: total <= BODY_BUDGET,
+    fits: total <= BODY_HIGH,
+    reapplied,
     results: trimmed["tool-result"],
     inputs: trimmed["tool-call"],
     messages: messages.length,
@@ -421,45 +577,90 @@ async function getSettings(ctx: any): Promise<Settings | undefined> {
   return undefined
 }
 
-async function sanitize(ctx: any, event: { sessionID?: string; messages: any[] }) {
+async function sanitize(ctx: any, hook: string, event: { sessionID?: string; messages: any[] }) {
   const { images, apply, toolInputsFixed } = collect(event.messages)
-  if (!images.length) return void (toolInputsFixed && debug({ at: new Date().toISOString(), toolInputsFixed }))
-  const sessionID = (event.sessionID ?? "sin-sesion").replace(/[^\w.-]/g, "_")
-  try {
-    assignNumbers(sessionID, images)
-  } catch (e) {
-    debug({ at: "index-error", error: String(e) })
-  }
-  const kept = chooseKept(images)
-  // Descripciones solo de imágenes nuevas, en paralelo; nunca rompen la petición.
-  const unique = [...new Map(images.map((img) => [img.hash, img])).values()]
-  const needsCaption = unique.some((img) => !existsSync(join(ROOT, "captions", `${img.hash}.txt`)))
+  if (!images.length) return void (toolInputsFixed && debug({ at: "tool-inputs", hook, toolInputsFixed }))
+  const session = safeSession(event.sessionID)
+  // Bloque síncrono: numeración, rutas y descartes se leen y se guardan sin await entre medias.
+  const records = decideImages(session, images, hook !== "title")
+  // Descripciones solo de apariciones nuevas, en paralelo; nunca rompen la petición.
+  const pending = [...new Map(images.filter((_, i) => records[i].caption === undefined).map((img) => [img.hash, img])).values()]
+  const needsCaption = pending.some((img) => !existsSync(join(ROOT, "captions", `${img.hash}.txt`)))
   const settings = needsCaption ? await getSettings(ctx) : undefined
   const captions = new Map(
-    await Promise.all(unique.map(async (img) => [img.hash, await describe(img, settings).catch(() => "")] as const)),
+    await Promise.all(pending.map(async (img) => [img.hash, await describe(img, settings).catch(() => "")] as const)),
   )
+  if (hook !== "title") freezeCaptions(session, images, records, captions)
   images.forEach((img, i) => {
-    const keep = kept.has(i)
+    const keep = !records[i].dropped
     const fields = [
       img.number ? `imagen ${img.number}${keep ? "" : " omitida"}` : keep ? "imagen" : "imagen omitida",
       img.filename && img.path !== img.filename ? `${img.path} (adjunto ${img.filename})` : img.path,
-      captions.get(img.hash),
+      records[i].caption ?? captions.get(img.hash),
       keep ? undefined : "vuelve a leer ese archivo con read si la necesitas",
     ]
     img.replace(`[${fields.filter(Boolean).join(" · ")}]`, keep)
   })
   apply()
+  const kept = images.filter((_, i) => !records[i].dropped)
   debug({
-    at: new Date().toISOString(),
+    at: "images",
+    hook,
     session: event.sessionID,
     images: images.length,
-    kept: kept.size,
-    dropped: images.length - kept.size,
-    keptBytes: [...kept].reduce((s, i) => s + images[i].bytes, 0),
-    totalBytes: images.reduce((s, img) => s + img.bytes, 0),
-    labels: images.map((img, i) => `${img.number}${kept.has(i) ? "" : "x"}`).join(","),
+    kept: kept.length,
+    dropped: images.length - kept.length,
+    keptBytes: kept.reduce((t, img) => t + img.bytes, 0),
+    totalBytes: images.reduce((t, img) => t + img.bytes, 0),
+    labels: images.map((img, i) => `${img.number}${records[i].dropped ? "x" : ""}`).join(","),
     toolInputsFixed,
   })
+}
+
+// ---------- Depuración: ¿se mantiene el prefijo? ----------
+
+// Cada `opencode run` es un proceso nuevo, así que lo anterior se guarda junto al estado de la sesión.
+function debugPrefix(hook: string, sessionID: unknown, messages: any[]) {
+  const file = join(ROOT, safeSession(sessionID), `debug-prefix-${hook}.json`)
+  const hashes = messages.map((m) => hashOf(JSON.stringify(m)))
+  const previous: string[] = readJSON(file) ?? []
+  let same = 0
+  while (same < previous.length && same < hashes.length && previous[same] === hashes[same]) same++
+  debug({
+    at: "prefix",
+    hook,
+    session: sessionID,
+    messages: hashes.length,
+    previous: previous.length,
+    // null: los mensajes de la petición anterior siguen intactos y en el mismo orden.
+    firstChanged: same < previous.length ? same : null,
+  })
+  writeFile(file, JSON.stringify(hashes))
+}
+
+function commonPrefixBytes(a: string, b: string) {
+  let i = 0
+  const n = Math.min(a.length, b.length)
+  while (i < n && a.charCodeAt(i) === b.charCodeAt(i)) i++
+  return Buffer.byteLength(a.slice(0, i))
+}
+
+// Último objeto usage de una respuesta (SSE de streaming o JSON).
+function lastUsage(body: string) {
+  const lines = body.split("\n")
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i]
+    if (!line.startsWith("data:") || !line.includes('"usage"')) continue
+    try {
+      const usage = JSON.parse(line.slice(5)).usage
+      if (usage) return usage
+    } catch {}
+  }
+  try {
+    return JSON.parse(body).usage
+  } catch {
+    return undefined
+  }
 }
 
 export default {
@@ -467,31 +668,74 @@ export default {
   async setup(ctx: any) {
     const hook = (name: string) => async (event: any) => {
       try {
-        await sanitize(ctx, event)
+        await sanitize(ctx, name, event)
       } catch (e) {
-        debug({ at: "sanitize-error", error: String(e) })
+        debug({ at: "sanitize-error", hook: name, error: String(e) })
       }
       try {
         fitBudget(name, event)
       } catch (e) {
-        debug({ at: "budget-error", error: String(e) })
+        debug({ at: "budget-error", hook: name, error: String(e) })
       }
+      if (DEBUG)
+        try {
+          debugPrefix(name, event.sessionID, event.messages)
+        } catch (e) {
+          debug({ at: "prefix-error", hook: name, error: String(e) })
+        }
     }
     for (const name of ["context", "compaction", "generate", "title"]) {
       await ctx.session.hook(name, hook(name), { providerID: PROVIDER })
     }
     if (DEBUG) {
-      // Solo depuración: cuántas imágenes y bytes (UTF-8) salen realmente en el cuerpo HTTP.
+      // Solo depuración: bytes (UTF-8) e imágenes del cuerpo HTTP real y cuántos bytes iniciales
+      // coinciden con la petición anterior de la misma sesión, modelo y tipo (kind: título o no).
       await ctx.session.hook(
         "http.request",
         async (e: any) => {
           const body = await e.request.clone().text()
+          const session = e.sessionID
+          let prefixBytes: number | undefined
+          if (session) {
+            const file = join(ROOT, safeSession(session), `debug-body-${safeSession(`${e.kind}-${e.model?.id}`)}.txt`)
+            if (existsSync(file)) prefixBytes = commonPrefixBytes(readFileSync(file, "utf8"), body)
+            writeFile(file, body)
+          }
           debug({
             at: "wire",
+            session,
+            kind: e.kind,
             model: e.model?.id,
             bytes: Buffer.byteLength(body),
+            prefixBytes,
             image_url: (body.match(/"type":"image_url"/g) ?? []).length,
           })
+        },
+        { providerID: PROVIDER },
+      )
+      // Tokens en caché que informa RunInfra. La copia se lee en segundo plano: no frena el stream.
+      await ctx.session.hook(
+        "http.response",
+        async (e: any) => {
+          const res: Response | undefined = e.response
+          if (!res?.body) return
+          void res
+            .clone()
+            .text()
+            .then((body) => {
+              const usage = lastUsage(body)
+              debug({
+                at: "usage",
+                session: e.sessionID,
+                kind: e.kind,
+                model: e.model?.id,
+                status: res.status,
+                prompt_tokens: usage?.prompt_tokens,
+                cached_tokens: usage?.prompt_tokens_details?.cached_tokens,
+                runinfra_cached_input_tokens: usage?.runinfra?.cached_input_tokens,
+              })
+            })
+            .catch((err) => debug({ at: "usage-error", error: String(err) }))
         },
         { providerID: PROVIDER },
       )

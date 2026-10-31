@@ -2,12 +2,13 @@
 // Ejecutar:  bun test
 // Otra copia del plugin:  RUNINFRA_SANITIZE_PLUGIN=/ruta/al/plugin.ts bun test
 import { afterAll, beforeAll, describe, expect, test } from "bun:test"
-import { mkdtempSync, rmSync } from "node:fs"
+import { existsSync, mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
 const PLUGIN = process.env.RUNINFRA_SANITIZE_PLUGIN ?? join(import.meta.dir, "../plugins/runinfra-sanitize.ts")
-const BUDGET = 3_000_000
+const BUDGET = 3_000_000 // BODY_HIGH
+const BODY_LOW = 2_000_000
 const OUTPUT_NOTE = "[salida recortada para respetar el límite de 3.5 MB de RunInfra"
 const INPUT_NOTE = "[recortado para respetar el límite de 3.5 MB de RunInfra]"
 
@@ -69,6 +70,13 @@ function history() {
   }
   return msgs
 }
+
+// Los mensajes de la petición anterior siguen idénticos byte a byte (solo se añadió al final).
+function expectPrefix(prev: any[], next: any[]) {
+  expect(next.length).toBeGreaterThanOrEqual(prev.length)
+  for (let i = 0; i < prev.length; i++) expect(JSON.stringify(next[i])).toBe(JSON.stringify(prev[i]))
+}
+const firstChanged = (prev: any[], next: any[]) => prev.findIndex((m, i) => JSON.stringify(m) !== JSON.stringify(next[i]))
 
 const pairs = (messages: any[]) =>
   messages.flatMap((m) =>
@@ -200,6 +208,72 @@ describe("presupuesto de tamaño", () => {
   })
 })
 
+describe("caché de prompts: recorte por lotes", () => {
+  // Sesión que crece de dos en dos mensajes (lectura de ~100 KB); objetos nuevos en cada
+  // petición, como hace opencode al reconstruir el historial guardado.
+  const growing = (reads: number) => {
+    const msgs: any[] = [{ role: "system", content: "x".repeat(50_000) }, user("empieza")]
+    for (let i = 0; i < reads; i++) {
+      msgs.push(call(`g${i}`, "read", { path: `/tmp/g${i}.txt` }))
+      msgs.push(result(`g${i}`, "read", { type: "text", value: big(100_000, `g${i}`) }))
+    }
+    return msgs
+  }
+  const cutCount = (out: any[]) => out.filter((m) => m.role === "tool" && m.content[0].result.value.includes(OUTPUT_NOTE)).length
+
+  test("al pasar de 3,0 MB recorta hasta ≤ 2,0 MB y los turnos siguientes solo añaden", async () => {
+    const ses = "ses_body_batch"
+    let reads = 25
+    let prev = await run(growing(reads), "context", ses)
+    expect(cutCount(prev)).toBe(0)
+    // Crecer hasta el primer lote.
+    while (cutCount(prev) === 0) {
+      expect(reads).toBeLessThan(40)
+      const next = await run(growing(++reads), "context", ses)
+      if (cutCount(next) === 0) expectPrefix(prev, next)
+      prev = next
+    }
+    expect(wireBytes(growing(reads))).toBeGreaterThan(BUDGET)
+    expect(cutCount(prev)).toBeGreaterThan(0)
+    expect(wireBytes(prev)).toBeLessThanOrEqual(BODY_LOW)
+    const cut = cutCount(prev)
+    // Los siguientes turnos (hasta volver a 3,0 MB) no recortan más: prefijo idéntico byte a byte.
+    let turns = 0
+    for (;;) {
+      expect(turns).toBeLessThan(30)
+      const next = await run(growing(++reads), "context", ses)
+      if (cutCount(next) > cut) {
+        // Segundo lote: lo ya recortado sigue igual; cambia a partir del primer mensaje nuevo recortado.
+        const changed = firstChanged(prev, next)
+        expect(changed).toBeGreaterThan(2 * cut)
+        expect(wireBytes(next)).toBeLessThanOrEqual(BODY_LOW)
+        break
+      }
+      expectPrefix(prev, next)
+      expect(cutCount(next)).toBe(cut)
+      expect(wireBytes(next)).toBeLessThanOrEqual(BUDGET)
+      prev = next
+      turns++
+    }
+    expect(turns).toBeGreaterThanOrEqual(5)
+  })
+
+  test("determinista: la misma entrada da los mismos bytes (misma sesión o sesión nueva)", async () => {
+    const msgs = () => growing(33)
+    const a = JSON.stringify(await run(msgs(), "context", "ses_det_a"))
+    const b = JSON.stringify(await run(msgs(), "context", "ses_det_a"))
+    const c = JSON.stringify(await run(msgs(), "context", "ses_det_b"))
+    expect(b).toBe(a)
+    expect(c).toBe(a)
+  })
+
+  test("las peticiones de título no guardan estado", async () => {
+    const out = await run(growing(33), "title", "ses_title_only")
+    expect(wireBytes(out)).toBeLessThanOrEqual(BODY_LOW)
+    expect(existsSync(join(cache, "opencode-runinfra", "ses_title_only", "index.json"))).toBe(false)
+  })
+})
+
 describe("comportamiento previo", () => {
   const img = (n: number, size = 1000) => Buffer.alloc(size, n).toString("base64")
   const media = (data: string) => ({
@@ -220,44 +294,105 @@ describe("comportamiento previo", () => {
       ),
     ).length
 
-  test("conserva las 6 imágenes más recientes con etiquetas numeradas estables", async () => {
-    const msgs = (count: number) => {
-      const out: any[] = []
-      for (let i = 1; i <= count; i++) {
-        if (i % 2) out.push({ role: "user", content: [media(img(i))] })
-        else {
-          out.push(call(`r${i}`, "read", { filePath: `/no/existe/${i}.png` }))
-          out.push(result(`r${i}`, "read", { type: "content", value: [{ type: "file", mime: "image/png", uri: `data:image/png;base64,${img(i)}` }] }))
-        }
+  // Imagen i: impares como adjunto del usuario, pares como resultado de read.
+  const imageMsgs = (count: number, from = 1) => {
+    const out: any[] = []
+    for (let i = from; i <= count; i++) {
+      if (i % 2) out.push({ role: "user", content: [media(img(i))] })
+      else {
+        out.push(call(`r${i}`, "read", { filePath: `/no/existe/${i}.png` }))
+        out.push(result(`r${i}`, "read", { type: "content", value: [{ type: "file", mime: "image/png", uri: `data:image/png;base64,${img(i)}` }] }))
       }
-      return out
     }
-    const first = await run(msgs(8), "context", "ses_labels")
-    expect(inline(first)).toBe(6)
-    const labels = texts(first).filter((t) => t.startsWith("[imagen"))
-    expect(labels.map((t) => t.match(/^\[imagen \d+( omitida)?/)![0])).toEqual([
-      "[imagen 1 omitida",
-      "[imagen 2 omitida",
-      "[imagen 3",
-      "[imagen 4",
-      "[imagen 5",
-      "[imagen 6",
-      "[imagen 7",
-      "[imagen 8",
-    ])
-    expect(labels[0]).toContain("vuelve a leer")
-    // Segunda petición con una imagen más: los números no cambian.
-    const second = await run(msgs(9), "context", "ses_labels")
-    expect(inline(second)).toBe(6)
-    expect(texts(second).filter((t) => t.startsWith("[imagen")).map((t) => t.match(/^\[imagen \d+/)![0])).toEqual(
-      Array.from({ length: 9 }, (_, i) => `[imagen ${i + 1}`),
-    )
+    return out
+  }
+  const labelsOf = (out: any[]) => texts(out).filter((t) => t.startsWith("[imagen")).map((t) => t.match(/^\[imagen \d+( omitida)?/)![0])
+  const expected = (dropped: number, total: number) =>
+    Array.from({ length: total }, (_, i) => `[imagen ${i + 1}${i < dropped ? " omitida" : ""}`)
+
+  test("imágenes por lotes: hasta 8 en línea; la 9.ª deja 4 y las siguientes solo se añaden", async () => {
+    const ses = "ses_images_batch"
+    let prev = await run(imageMsgs(8), "context", ses)
+    expect(inline(prev)).toBe(8)
+    expect(labelsOf(prev)).toEqual(expected(0, 8))
+
+    // 9.ª imagen: se pasa del límite duro → se descartan las más antiguas hasta 4.
+    let next = await run(imageMsgs(9), "context", ses)
+    expect(inline(next)).toBe(4)
+    expect(labelsOf(next)).toEqual(expected(5, 9))
+    expect(texts(next).find((t) => t.startsWith("[imagen 1 omitida"))).toContain("vuelve a leer")
+    expect(firstChanged(prev, next)).toBe(0) // el lote sí cambia el prefijo (imagen 1, primer mensaje)
+
+    // 10.ª a 13.ª: se añaden sin tocar nada anterior (prefijo idéntico byte a byte).
+    prev = next
+    for (let n = 10; n <= 13; n++) {
+      next = await run(imageMsgs(n), "context", ses)
+      expectPrefix(prev, next)
+      expect(inline(next)).toBe(n - 5)
+      expect(labelsOf(next)).toEqual(expected(5, n))
+      prev = next
+    }
+
+    // 14.ª: otra vez 9 en línea → nuevo lote hasta 4; las ya omitidas no cambian.
+    next = await run(imageMsgs(14), "context", ses)
+    expect(inline(next)).toBe(4)
+    expect(labelsOf(next)).toEqual(expected(10, 14))
+    const firstImage6 = prev.findIndex((m) => JSON.stringify(m).includes("[imagen 6"))
+    expect(firstChanged(prev, next)).toBe(firstImage6)
+    for (let i = 0; i < firstImage6; i++) expect(JSON.stringify(next[i])).toBe(JSON.stringify(prev[i]))
+
+    // Repetir la misma petición da exactamente los mismos bytes.
+    expect(JSON.stringify(await run(imageMsgs(14), "context", ses))).toBe(JSON.stringify(next))
+  })
+
+  test("una imagen descartada que se vuelve a leer se ve (otra aparición, mismo número)", async () => {
+    const ses = "ses_reread"
+    await run(imageMsgs(8), "context", ses)
+    const base = imageMsgs(9)
+    await run(base, "context", ses)
+    const reread = [
+      ...imageMsgs(9),
+      call("again1", "read", { filePath: "/no/existe/2.png" }),
+      result("again1", "read", { type: "content", value: [{ type: "file", mime: "image/png", uri: `data:image/png;base64,${img(2)}` }] }),
+    ]
+    const out = await run(reread, "context", ses)
+    expect(labelsOf(out)).toEqual([...expected(5, 9), "[imagen 2"])
+    expect(inline(out)).toBe(5)
+  })
+
+  test("nunca más de 8 en línea, contando las nuevas de la propia petición", async () => {
+    // Sesión nueva con 10 imágenes: todas nuevas → se quedan las 8 más recientes.
+    const a = await run(imageMsgs(10), "context", "ses_cap_a")
+    expect(inline(a)).toBe(8)
+    expect(labelsOf(a)).toEqual(expected(2, 10))
+    // 3 ya vistas + 7 nuevas en la misma petición: se conservan las 7 nuevas (≤ 8), no solo 4.
+    await run(imageMsgs(3), "context", "ses_cap_b")
+    const b = await run(imageMsgs(10), "context", "ses_cap_b")
+    expect(inline(b)).toBe(7)
+    expect(labelsOf(b)).toEqual(expected(3, 10))
   })
 
   test("tope de base64 en línea: descarta las más antiguas hasta ~2,5 MB", async () => {
     const out = await run([1, 2, 3].map((n) => ({ role: "user", content: [media(img(n, 750_000))] })))
     expect(inline(out)).toBe(2)
     expect(texts(out)[0]).toMatch(/^\[imagen 1 omitida/)
+  })
+
+  test("tope de base64 por lotes: al pasar de 2,5 MB baja a ≤ 1,5 MB y luego solo añade", async () => {
+    const ses = "ses_inline_batch"
+    const shots = (n: number) => Array.from({ length: n }, (_, i) => ({ role: "user", content: [media(img(i + 1, 300_000))] })) // 400 KB c/u
+    let prev = await run(shots(6), "context", ses) // 2,4 MB: cabe
+    expect(inline(prev)).toBe(6)
+    let next = await run(shots(7), "context", ses) // 2,8 MB → lote hasta ≤ 1,5 MB (3 imágenes)
+    expect(inline(next)).toBe(3)
+    expect(labelsOf(next)).toEqual(expected(4, 7))
+    prev = next
+    for (let n = 8; n <= 9; n++) {
+      next = await run(shots(n), "context", ses)
+      expectPrefix(prev, next)
+      expect(inline(next)).toBe(n - 4)
+      prev = next
+    }
   })
 
   test("no muta las partes originales al etiquetar imágenes", async () => {
